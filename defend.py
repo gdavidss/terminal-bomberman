@@ -16,8 +16,6 @@ class Node:
 def simulate_explosions(maze):
     """Simulate explosions by converting bombs (2) to fire (3) based on their explosion radius"""
     
-    # theres a bug here it shouldnt simulate past walls
-    
     rows = len(maze)
     cols = len(maze[0])
     new_maze = [row[:] for row in maze]  # Copy of the maze
@@ -31,11 +29,14 @@ def simulate_explosions(maze):
                 new_maze[y][x] = 3
                 # Spread the explosion in the four directions
                 for dx, dy in directions:
-                    for i in range(1, 3):  # Radius of 2
+                    for i in range(1, 4):  # Radius of 3 (default bomb radius)
                         nx, ny = x + dx * i, y + dy * i
                         if 0 <= nx < cols and 0 <= ny < rows:
-                            if new_maze[ny][nx] != 1:  # Only spread fire over empty cells
-                                new_maze[ny][nx] = 3
+                            if maze[ny][nx] == 1:  # Wall stops the explosion
+                                break
+                            new_maze[ny][nx] = 3  # Mark as dangerous (will explode)
+                        else:
+                            break  # Out of bounds
 
     return new_maze
 
@@ -99,8 +100,18 @@ def defend_astar(maze, start):
 
             # Create new node with a higher cost for moving into fire
             new_node = Node(current_node, node_position)
-            new_node.g = current_node.g + (2 if maze[node_position[1]][node_position[0]] == 3 else 1)  # Higher cost for fire
-            new_node.h = ((new_node.position[0] - start[0]) ** 2) + ((new_node.position[1] - start[1]) ** 2)
+            # Much higher cost for fire zones to strongly discourage going through them
+            new_node.g = current_node.g + (10 if maze[node_position[1]][node_position[0]] == 3 else 1)
+            # Heuristic: prefer moving away from danger zones, not staying close to start
+            # Count nearby danger zones
+            danger_nearby = 0
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    check_x, check_y = node_position[0] + dx, node_position[1] + dy
+                    if 0 <= check_x < len(maze[0]) and 0 <= check_y < len(maze):
+                        if maze[check_y][check_x] == 3 or maze[check_y][check_x] == 2:
+                            danger_nearby += 1
+            new_node.h = danger_nearby * 5  # Prefer spots with less danger nearby
             new_node.f = new_node.g + new_node.h
 
             # Skip nodes already in the closed list

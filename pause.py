@@ -8,33 +8,25 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pygame")  # Hide
 
 import time
 import random
-import argparse
 from pynput import keyboard
 import threading
 from collections import deque, defaultdict
 from attack import attack_astar
 from defend import defend_astar
-import traceback
-if os.name == 'nt':
-    import msvcrt
-else:
-    import termios, tty, select
 
-# Debug/diagnostics controls via environment variables
-ENABLE_CLEAR = os.environ.get('NO_CLEAR', '0') != '1'
-DEBUG_KEYS = os.environ.get('DEBUG_KEYS', '0') == '1'
-# In debug (NO_CLEAR=1), disable continuous rendering unless RENDER=1 is set
-RENDER_ENABLED = os.environ.get('RENDER', '1' if ENABLE_CLEAR else '0') == '1'
-last_key_event = None
+# Platform-specific imports
+if os.name != 'nt':
+    import termios
+    import tty
+    import select
 
-def clear_screen():
-    if ENABLE_CLEAR:
-        os.system("cls" if os.name =="nt" else "clear")
-    else:
-        # When not clearing, reposition to top-left and clear to end so we don't accumulate history
-        sys.stdout.write('\033[H')  # cursor to top-left
-        sys.stdout.write('\033[J')  # clear from cursor to end of screen
-        sys.stdout.flush()
+# Music imports
+MUSIC_AVAILABLE = False
+try:
+    from music import start_jungle_music, stop_jungle_music, toggle_music, play_stage_start, play_game_over, play_victory, wait_for_music, init_sound_effects, play_bomb_explosion, pause_music, unpause_music, play_bomberman_scream, play_pause_sound, play_select_sound, toggle_sound_effects, music_enabled, play_i_won_sound, play_nooo_sound, play_bomb_up_sound
+    MUSIC_AVAILABLE = True
+except ImportError:
+    pass
 try:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -44,46 +36,62 @@ except ImportError:
     JOYSTICK_AVAILABLE = False
     # Silently skip - joystick just won't be available
 
-# Optional pygame backend for joysticks (works on macOS without opening a window)
-try:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        import pygame
-    PYGAME_AVAILABLE = True
-except ImportError:
-    PYGAME_AVAILABLE = False
+# Joystick globals
+gamepad2 = None  # Second controller for player2 (not used in pause.py, kept for consistency)
 
-# Import music module
-try:
-    from music import start_jungle_music, stop_jungle_music, toggle_music, play_stage_start, play_game_over, play_victory, wait_for_music, init_sound_effects, play_bomb_explosion, pause_music, unpause_music, play_bomberman_scream, play_pause_sound, play_select_sound, toggle_sound_effects, music_enabled, play_i_won_sound, play_nooo_sound, play_bomb_up_sound
-    MUSIC_AVAILABLE = True
-except ImportError:
-    MUSIC_AVAILABLE = False
-    pass  # Music module not available - fail silently
+# Clear screen function
+def clear_screen():
+    os.system("cls" if os.name =="nt" else "clear")
 
-# Selected joystick backend: 'inputs' | 'pygame' | None
-joystick_backend = None
-gamepad2 = None  # Second controller for player2
+# Constants
+DEFAULT_SIZE = 12  # Increased by 20% from 10
+SIZE = DEFAULT_SIZE
+PERCENTAGE = 70
+FPS = 30
+NUM_NPCS = 1  # Number of NPC enemies (1-3)
 
-# Keep track of the last error so we can display it despite screen redraws
-last_error = ""
+# Grid values
+WALL = 1
+PLAYER = -1
+PLAYER2 = -2
+ENEMY = -3
+CIRCLE = 2
+FIRE = 3
+BOMB_ITEM = 4  # 🔢 Power-up to increase bomb capacity
+
+# Initialize scores
+player_score = 0
+enemy_score = 0
+MATCH_WINNING_SCORE = 5
+npc_scores = {}
+alive_npcs = []
+
+# Display mode
+minimal_mode = False  # Toggle with 'o' to show only grid and scoreboard
+
+# Initialize pause event and game state
+pause_event = threading.Event()
+pause_event.set()  # Game starts in unpaused state
+game_over_event = threading.Event()  # Set when game is over
+game_over_event.clear()  # Start not game over
+pause_start_time = None  # Track when pause started
 
 class Circle:
     all_fire_cells = defaultdict(int)
-    
+
     def __init__(self, pos, owner):
         self.pos = pos
         self.radius = 2
         self.timestamp = time.time()
         self.owner = owner
-    
+
     @staticmethod
     def detonate_circles(circles, grid, active_explosions):
         while circles and time.time() - circles[0].timestamp > 3:  # 3 seconds to detonate
             circle = circles.popleft()  # Pop the oldest circle
             Circle.create_explosion(circle, grid, active_explosions, circles)
             circle.owner.available_circles += 1
-    
+
     @staticmethod
     def create_explosion(circle, grid, active_explosions, circles):
         x, y = circle.pos
@@ -102,7 +110,7 @@ class Circle:
                 elif grid[y][x+i] == CIRCLE:
                     Circle.trigger_bomb(x+i, y, circles, grid)
                     break
-        
+
         # Horizontal explosion to the left
         for i in range(1, circle.radius+1):
             if x-i >= 0:
@@ -112,7 +120,7 @@ class Circle:
                 elif grid[y][x-i] == CIRCLE:
                     Circle.trigger_bomb(x-i, y, circles, grid)
                     break
-        
+
         # Vertical explosion downward
         for i in range(1, circle.radius+1):
             if y+i < SIZE:
@@ -122,7 +130,7 @@ class Circle:
                 elif grid[y+i][x] == CIRCLE:
                     Circle.trigger_bomb(x, y+i, circles, grid)
                     break
-        
+
         # Vertical explosion upward
         for i in range(1, circle.radius+1):
             if y-i >= 0:
@@ -132,10 +140,10 @@ class Circle:
                 elif grid[y-i][x] == CIRCLE:
                     Circle.trigger_bomb(x, y-i, circles, grid)
                     break
-        
+
         # The initial position where the bomb explodes
         explosion_cells.append((y, x))
-        
+
         # Set the explosion on the grid and remove walls
         for (cy, cx) in explosion_cells:
             # Check if this was a wall with a bomb item
@@ -149,7 +157,7 @@ class Circle:
                 print(f"💥 Bomb power-up at ({cx}, {cy}) was destroyed by fire!")
             grid[cy][cx] = FIRE
             Circle.all_fire_cells[(cy, cx)] += 1
-            
+
         active_explosions.append((time.time(), explosion_cells))
 
     @staticmethod
@@ -179,26 +187,15 @@ class Circle:
                             grid[y][x] = 0
                     Circle.all_fire_cells[(y, x)] -= 1
                 explosions_to_remove.append(explosion)
-            
-            # Check if the player(s) or enemy is in the fire area during fire phase
+
+            # Check if the player or enemy is in the fire area during fire phase
             for y, x in cells:
                 if player.pos == (x, y):
-                    print(f"{player.icon} was hit by the fire!")
+                    print(f"Game Over! {player.icon} was hit by the fire.")
                     show_death_animation(player.pos, grid, death_type="fire")
                     if MUSIC_AVAILABLE:
                         play_nooo_sound()  # Play nooo sound when human player dies
-                    if COOP:
-                        game_over('player2')
-                    else:
-                        game_over('npcs')  # NPCs win when player dies
-                    return
-                # In coop, also check player2
-                if COOP and player2 is not None and player2.pos == (x, y):
-                    print(f"Game Over! {player2.icon} was hit by the fire.")
-                    show_death_animation(player2.pos, grid, death_type="fire")
-                    if MUSIC_AVAILABLE:
-                        play_nooo_sound()  # Play nooo sound when human player dies
-                    game_over('player1')
+                    game_over('enemy')
                     return
                 for npc in npcs:
                     if npc.alive and npc.pos == (x, y):
@@ -217,17 +214,16 @@ class Circle:
 
 class Player:
     num_players = 0
-    
+
     def __init__(self):
         Player.num_players += 1
-        
+
         self.pos = (0, 0) if Player.num_players == 1 else (SIZE-1, SIZE-1)
         self.icon = "🔴" if Player.num_players == 1 else "🔵"
-        
+
         self.available_circles = 1  # Start with only 1 bomb
-        # In COOP mode: Player 1 (red) uses WASD, Player 2 (blue) uses arrow keys
         self.directions = ['w', 's', 'a', 'd'] if Player.num_players == 1 else ['i', 'k', 'j', 'l']
-        
+
     def put_circle(self, circles, grid):
         x, y = self.pos
         
@@ -235,18 +231,18 @@ class Player:
         for bomb in circles:
             if bomb.pos == (x, y):
                 return  # Don't place another bomb here
-        
+
         if self.available_circles > 0:
             circle = Circle(self.pos, owner=self)
             circles.append(circle)
             # For player, we still update grid since player moves away immediately
             grid[y][x] = CIRCLE
             self.available_circles -= 1
-    
+
     def move_player(self, direction, grid, enemy_pos=None):
         x, y = self.pos
         other_player = PLAYER2 if self.icon == "🔴" else PLAYER
-        
+
         new_x, new_y = x, y
 
         # Determine the new position based on the direction
@@ -292,18 +288,11 @@ class Player:
             if grid[new_y][new_x] == FIRE:
                 # Move player to the fire position first
                 self.pos = (new_x, new_y)
-                print(f"{self.icon} walked into the fire!")
+                print(f"Game Over! {self.icon} walked into the fire.")
                 show_death_animation(self.pos, grid, death_type="fire")
                 if MUSIC_AVAILABLE:
                     play_nooo_sound()  # Play nooo sound when human player dies
-                if COOP:
-                    # Other player wins
-                    if self.icon == "🔴":
-                        game_over('player2')
-                    else:
-                        game_over('player1')
-                else:
-                    game_over('npcs')  # NPCs win when player dies
+                game_over('enemy')  # Exit the game
                 return
 
             # Check if the new position has a bomb item
@@ -338,7 +327,7 @@ class Enemy:
         self.alive = True  # Track if this NPC is still alive
         self.previous_pos = None  # Track previous position to prevent oscillation
         self.stuck_counter = 0  # Track if enemy is stuck in same area
-    
+
     def put_circle(self, circles, grid):
         x, y = self.pos
         
@@ -346,17 +335,17 @@ class Enemy:
         for bomb in circles:
             if bomb.pos == (x, y):
                 return  # Don't place another bomb here
-        
+
         if self.available_circles > 0:
             circle = Circle(self.pos, owner=self)
             circles.append(circle)
-            
+
             # Don't overwrite the enemy's position in the grid
             # The bomb exists in the circles list, but the grid still shows the enemy
             # This will be handled when drawing/checking collisions
-            
+
             self.available_circles -= 1
-            
+
     def compute_next_moves(self, grid, player_pos):
         # Create a copy of the grid that includes all bombs from circles list
         grid_copy = [row[:] for row in grid]
@@ -449,7 +438,7 @@ class Enemy:
             # Remove any moves that would go back to previous position immediately
             if self.previous_pos and self.next_moves and self.next_moves[0] == self.previous_pos:
                 self.next_moves.pop(0)
-    
+
         if not self.next_moves:
             # If no moves, force recalculation with opposite mode
             self.defend_mode = not self.defend_mode
@@ -464,9 +453,9 @@ class Enemy:
                     self.defend_mode = not self.defend_mode
                     self.stuck_counter = 0
                 return
-        
+
         x, y = self.pos
-        
+
         new_x, new_y = self.next_moves.pop(0)
         
         # Prevent immediate backtracking
@@ -477,12 +466,10 @@ class Enemy:
             else:
                 # No other moves available, stay in place
                 return
-        
+
         # Check if the new position is valid
         has_bomb_at_dest = any(bomb.pos == (new_x, new_y) for bomb in circles)
         is_player_at_dest = (player.pos == (new_x, new_y))
-        if COOP and 'player2' in globals() and player2 is not None:
-            is_player_at_dest = is_player_at_dest or (player2.pos == (new_x, new_y))
         
         if grid[new_y][new_x] == WALL or grid[new_y][new_x] == CIRCLE or grid[new_y][new_x] == FIRE or has_bomb_at_dest or is_player_at_dest:
             # Path is blocked, recalculate
@@ -504,18 +491,17 @@ class Enemy:
             # Double-check the new position
             has_bomb_at_dest = any(bomb.pos == (new_x, new_y) for bomb in circles)
             is_player_at_dest = (player.pos == (new_x, new_y))
-            if COOP and 'player2' in globals() and player2 is not None:
-                is_player_at_dest = is_player_at_dest or (player2.pos == (new_x, new_y))
             
             if grid[new_y][new_x] == WALL or grid[new_y][new_x] == CIRCLE or grid[new_y][new_x] == FIRE or has_bomb_at_dest or is_player_at_dest:
                 # Still blocked - skip this turn
                 self.next_moves = []
                 return
-        
+
         # Only update the grid and position if the enemy actually moves
         if (new_x, new_y) != (x, y):
             # Double-check player positions one more time
             if grid[new_y][new_x] == PLAYER or grid[new_y][new_x] == PLAYER2:
+                # Enemy cannot move to where a player is - recalculate path
                 self.next_moves = []
                 return
             
@@ -532,15 +518,11 @@ class Enemy:
                         break
                 if not has_bomb:
                     grid[y][x] = 0  # Clear the cell
-            
-            # If the new position is fire, this enemy is eliminated
+
+            # If the new position is fire, the enemy loses
             if grid[new_y][new_x] == FIRE:
-                print(f"{self.icon} walked into the fire and was eliminated!")
-                self.alive = False
-                # Clear old position if it was the enemy
-                if grid[y][x] == ENEMY:
-                    grid[y][x] = 0
-                check_round_over()
+                print(f"Game Over! {self.icon} walked into the fire.")
+                game_over('player')  # Player was hit, enemy wins
                 return
             
             # Check if the new position has a bomb item
@@ -552,10 +534,10 @@ class Enemy:
                 # Remove the item from the bomb_items list
                 if hasattr(level_map, 'bomb_items') and (new_x, new_y) in level_map.bomb_items:
                     level_map.bomb_items.remove((new_x, new_y))
-            
+
             # Move the enemy to the new position on the grid
             grid[new_y][new_x] = ENEMY
-            
+
             # Track previous position to prevent oscillation
             self.previous_pos = (x, y)
             
@@ -564,33 +546,21 @@ class Enemy:
             
             # Reset stuck counter on successful move
             self.stuck_counter = 0
-            
+
             # If no moves left, prepare to put a circle (bomb) or switch modes
             if not self.next_moves:
                 if self.defend_mode:
                     self.defend_mode = False
-                    self.next_moves = self.compute_next_moves(grid, player_pos)
                 else:
-                    # Place bomb only if we can move away
                     self.put_circle(circles, grid)
                     self.defend_mode = True
-                    # After placing bomb, immediately compute escape path
-                    # Mark our current position as dangerous in grid temporarily
-                    old_val = grid[new_y][new_x] if (new_x, new_y) != (x, y) else grid[y][x]
-                    pos_y, pos_x = self.pos[1], self.pos[0]
-                    grid[pos_y][pos_x] = CIRCLE  # Temporarily mark as bomb to find escape
-                    self.next_moves = self.compute_next_moves(grid, player_pos)
-                    grid[pos_y][pos_x] = old_val  # Restore original value
-                    
-                    if not self.next_moves:
-                        # If still no moves, we're truly trapped
-                        self.next_moves = []
-                        return
-                
+                self.next_moves = self.compute_next_moves(grid, player_pos)
+
             self.last_move_time = current_time
-            
+
     def are_circles_nearby(self, grid):
         x, y = self.pos
+        radius = 5  # Increased radius for more aggressive detection
         
         # Check all bombs in the circles list for immediate threat
         for bomb in circles:
@@ -706,7 +676,7 @@ class Enemy:
             return escape_routes >= 2
         
         return False
-            
+
 class Map:
     def __init__(self, SIZE, percentage, num_npcs=1):
         # Start with player spawn area (3x3 safe zone)
@@ -755,7 +725,7 @@ class Map:
                     forbidden.append((i, SIZE-2))  # Second horizontal corridor
         
         grid = [[0] * SIZE for _ in range(SIZE)]
-        
+
         # Remove duplicates from forbidden list
         forbidden = list(set(forbidden))
         
@@ -855,26 +825,25 @@ class Map:
             # Place bomb items in selected walls
             for _, x, y in selected_walls:
                 self.bomb_items.append((x, y))
-        
-        grid[0][0] = PLAYER  # represents the player1
-        
-        if COOP:
-            grid[SIZE-1][SIZE-1] = PLAYER2
+
+        grid[0][0] = PLAYER  # represents the player
         
         self.grid = grid
 
     def draw(self, npc_list=None):
         # Use the passed npc_list or fall back to global variable
         if npc_list is None:
-            # Access the module-level npcs variable from globals
-            npc_list = globals().get('npcs', [])
+            # Access the module-level npcs variable
+            import sys
+            current_module = sys.modules[__name__]
+            npc_list = getattr(current_module, 'npcs', [])
         
         # Get the circles list to check for bombs
         circles_list = globals().get('circles', [])
         
         # Get player positions to handle overlap correctly
         player1_pos = globals().get('player').pos if 'player' in globals() and globals().get('player') else None
-        player2_pos = globals().get('player2').pos if 'player2' in globals() and globals().get('player2') else None
+        player2_pos = None  # Co-op not used in pause.py but kept for consistency
         
         print_scoreboard()
         for y, row in enumerate(self.grid):
@@ -906,72 +875,26 @@ class Map:
                     elif cell == PLAYER2:
                         # Only show player2 icon if actually at this position
                         if player2_pos == (x, y):
-                            print("🔵", end="")
+                            print("🔵", end="")  # Player 2 in co-op mode
                         else:
                             print("⬜", end="")  # Stale player marker, clear it
                     elif cell == ENEMY:
-                        # Find which NPC is at this position (only show if alive)
+                        # Find which NPC is at this position
                         npc_found = False
                         for npc in npc_list:
-                            if npc.alive and npc.pos == (x, y):
+                            if npc is not None and npc.pos == (x, y):
                                 print(npc.icon, end="")
                                 npc_found = True
                                 break
                         if not npc_found:
-                            # Cell marked as enemy but no alive NPC here - clear it
-                            print("⬜", end="")
+                            print("👾", end="")  # Fallback icon
                     elif cell == CIRCLE:
                         print("💣", end="")
                     elif cell == FIRE:
                         print("🔥", end="")
-                    elif cell == BOMB_ITEM:
-                        print("🔢", end="")
                     else:
                         print("⬜", end="")
             print()
-
-DEFAULT_SIZE = 12  # Increased by 20% from 10
-SIZE = DEFAULT_SIZE 
-
-PERCENTAGE = 70
-FPS = 30
-
-# Grid values
-WALL = 1
-PLAYER = -1
-PLAYER2 = -2
-ENEMY = -3
-
-CIRCLE = 2
-FIRE = 3
-BOMB_ITEM = 4  # 🔢 Power-up to increase bomb capacity
-
-# Game mode globals
-COOP = False
-player2 = None
-NUM_NPCS = 1  # Number of NPC enemies (1-3)
-npcs = []  # List of NPC enemies
-alive_npcs = []  # Track which NPCs are still alive
-MATCH_WINNING_SCORE = 5  # First to 5 wins the match
-
-
-def print_scoreboard():
-    if COOP:
-        print(f"Scoreboard: Player1 {player_score} - {enemy_score} Player2")
-    else:
-        # Display player score
-        player_trophies = '🏆' * player_score
-        
-        # Combine all NPC icons and sum their scores
-        npc_icons = ''.join(sorted(npc_scores.keys()))
-        total_npc_score = sum(npc_scores.values())
-        npc_trophies = '🏆' * total_npc_score
-        
-        # Print scoreboard
-        print(f"🔴 Player: {player_trophies if player_trophies else '0'}  |  {npc_icons}: {npc_trophies if npc_trophies else '0'}")
-        print()  # Add newline after scoreboard
-    if last_error:
-        print(f"Error: {last_error}")
 
 def check_round_over():
     """Check if the round is over (all NPCs dead or player dead)"""
@@ -980,7 +903,7 @@ def check_round_over():
     # Update alive_npcs list
     alive_npcs = [npc for npc in npcs if npc.alive]
     
-    if not alive_npcs and not COOP:
+    if not alive_npcs:
         # All NPCs are dead, player wins the round
         print("\n🎉 Round Over! Player wins this round!")
         player_score += 1
@@ -1006,12 +929,9 @@ def check_round_over():
 
 def match_winner(winner_name):
     """Handle when someone wins the entire match"""
-    global game_over_event, keyboard_stop
-    game_over_event.set()
+    global player_score, enemy_score, npc_scores, game_over_event
     
-    # Temporarily stop keyboard thread to prevent interference
-    keyboard_stop = True
-    time.sleep(0.1)  # Give keyboard thread time to stop
+    game_over_event.set()
     
     # Play victory or game over music
     if MUSIC_AVAILABLE:
@@ -1021,27 +941,23 @@ def match_winner(winner_name):
         else:
             play_game_over()
     
-    # Clear screen and show match winner
-    if RENDER_ENABLED:
-        clear_screen()
-    
+    os.system("cls" if os.name == "nt" else "clear")
     print("\n" + "="*50)
-    print(f"🏆 MATCH OVER! {winner_name} WINS THE MATCH! 🏆")
+    print(f"🏆🏆🏆 {winner_name} WINS THE MATCH! 🏆🏆🏆")
     print("="*50)
+    
+    print("\nFinal Scores:")
     print_scoreboard()
-    print("\nPlay another match? (y/n): ", end="")
+    
+    print("\nPlay another match? (y/n): ", end='')
     sys.stdout.flush()
     
-    # Clear any pending input
-    if os.name != 'nt':
-        termios.tcflush(sys.stdin, termios.TCIFLUSH)
-    
     # Get user input
+    response = ''
     if os.name == 'nt':
         import msvcrt
         response = msvcrt.getch().decode('utf-8').lower()
     else:
-        # Restore terminal settings temporarily to get input
         fd = sys.stdin.fileno()
         old_attrs = termios.tcgetattr(fd)
         try:
@@ -1055,12 +971,12 @@ def match_winner(winner_name):
         if MUSIC_AVAILABLE:
             play_select_sound()
         
-        # Reset scores and start new match
-        global player_score, enemy_score, npc_scores
+        # Reset ALL scores for new match
         player_score = 0
         enemy_score = 0
         for icon in npc_scores:
             npc_scores[icon] = 0
+        game_over_event.clear()
         
         # Play stage start music then battle music
         if MUSIC_AVAILABLE:
@@ -1069,17 +985,27 @@ def match_winner(winner_name):
             threading.Timer(3.0, start_jungle_music).start()
         
         reset_game()
-        
-        # Re-enable keyboard thread and clear game over state
-        keyboard_stop = False
-        # Restart keyboard thread
-        kb_thread = threading.Thread(target=keyboard_loop, daemon=True)
-        kb_thread.start()
-        
-        game_over_event.clear()
     else:
         print("\nThanks for playing!")
         os._exit(0)
+
+def print_scoreboard():
+    # Move the cursor to the top-left corner
+    sys.stdout.write('\033[H')
+    sys.stdout.flush()
+    global player_score, enemy_score, npc_scores
+    
+    # Display player score
+    player_trophies = '🏆' * player_score
+    
+    # Combine all NPC icons and sum their scores
+    npc_icons = ''.join(sorted(npc_scores.keys()))
+    total_npc_score = sum(npc_scores.values())
+    npc_trophies = '🏆' * total_npc_score
+    
+    # Print scoreboard
+    print(f"🔴 Player: {player_trophies if player_trophies else '0'}  |  {npc_icons}: {npc_trophies if npc_trophies else '0'}")
+    print()  # Add newline after scoreboard
 
 def show_death_animation(player_pos, grid, death_type="enemy"):
     """Show death animation based on death type"""
@@ -1093,9 +1019,8 @@ def show_death_animation(player_pos, grid, death_type="enemy"):
     # Don't change grid for enemy collision - player and enemy overlap
     
     # Clear and redraw
-    if RENDER_ENABLED:
-        clear_screen()
-        level_map.draw(npcs)
+    os.system("cls" if os.name == "nt" else "clear")
+    level_map.draw(npcs)
     
     # Show death message
     print("\n💀 PLAYER DIED! 💀")
@@ -1114,177 +1039,243 @@ def game_over(winner):
     # Find which NPCs are still alive
     alive_icons = [npc.icon for npc in npcs if npc.alive]
     
-    if RENDER_ENABLED:
-        clear_screen()
+    os.system("cls" if os.name == "nt" else "clear")
     
-    if COOP:
-        global player_score, enemy_score
-        if winner == 'player1':
-            print("\n\n🎮 ROUND OVER! Player1 wins this round! 🎮")
-            player_score += 1
-        elif winner == 'player2':
-            print("\n\n🎮 ROUND OVER! Player2 wins this round! 🎮")
-            enemy_score += 1
-        else:
-            print(f"\n\n🎮 ROUND OVER! {winner} wins this round! 🎮")
+    # Player died, alive NPCs win a point each
+    if alive_icons:
+        print(f"\n\n💀 ROUND OVER! Player died! 💀")
+        print(f"Surviving enemies win this round: {' '.join(alive_icons)}")
         
-        # Check for match winner in coop
-        if player_score >= MATCH_WINNING_SCORE:
-            match_winner('Player1')
-        elif enemy_score >= MATCH_WINNING_SCORE:
-            match_winner('Player2')
-        else:
-            # Play stage start music for new round (COOP mode)
-            if MUSIC_AVAILABLE:
-                play_stage_start()
-                # Schedule battle music to start after stage start finishes
-                threading.Timer(3.0, start_jungle_music).start()
-            
-            reset_game()
+        # Check BEFORE incrementing if we would reach the winning score
+        for icon in alive_icons:
+            if icon in npc_scores:
+                # Check if this NPC would win the match
+                if npc_scores[icon] + 1 >= MATCH_WINNING_SCORE:
+                    npc_scores[icon] += 1  # Add the final point
+                    npc_icons = ''.join(sorted(npc_scores.keys()))
+                    match_winner(f'{npc_icons} Enemies')
+                    return
+        
+        # If no one won yet, increment scores normally
+        for icon in alive_icons:
+            if icon in npc_scores:
+                npc_scores[icon] += 1
     else:
-        # Player died, alive NPCs win a point each
-        if alive_icons:
-            print(f"\n\n💀 ROUND OVER! Player died! 💀")
-            print(f"Surviving enemies win this round: {' '.join(alive_icons)}")
-            
-            # Check BEFORE incrementing if we would reach the winning score
-            for icon in alive_icons:
-                if icon in npc_scores:
-                    # Check if this NPC would win the match
-                    if npc_scores[icon] + 1 >= MATCH_WINNING_SCORE:
-                        npc_scores[icon] += 1  # Add the final point
-                        npc_icons = ''.join(sorted(npc_scores.keys()))
-                        match_winner(f'{npc_icons} Enemies')
-                        return
-            
-            # If no one won yet, increment scores normally
-            for icon in alive_icons:
-                if icon in npc_scores:
-                    npc_scores[icon] += 1
-        else:
-            print("\n\n🎮 ROUND OVER! Draw! 🎮")
-        
-        print_scoreboard()
-        print("\nPress any button to continue...")
-        sys.stdout.flush()
-        
-        # Wait for any input (keyboard or controller)
-        wait_for_any_input()
-        
-        # Play stage start music for new round
-        if MUSIC_AVAILABLE:
-            play_stage_start()
-            # Schedule battle music to start after stage start finishes
-            threading.Timer(3.0, start_jungle_music).start()
-        
-        reset_game()
+        print("\n\n🎮 ROUND OVER! Draw! 🎮")
     
+    print_scoreboard()
+    print("\nPress any button to continue...")
+    sys.stdout.flush()
+    
+    # Wait for any input (keyboard or controller)
+    wait_for_any_input()
+    
+    # Play stage start music for new round
+    if MUSIC_AVAILABLE:
+        play_stage_start()
+        # Schedule battle music to start after stage start finishes
+        threading.Timer(3.0, start_jungle_music).start()
+    
+    reset_game()
+
+def wait_for_any_input():
+    """Wait for keyboard or controller input"""
+    # Wait for keyboard or any controller button
+    if os.name == 'nt':
+        import msvcrt
+        # Windows: check both keyboard and controller
+        while True:
+            if msvcrt.kbhit():
+                msvcrt.getch()
+                return
+            # Check for any controller button
+            if gamepad and JOYSTICK_AVAILABLE:
+                try:
+                    events = inputs.get_gamepad()
+                    for event in events:
+                        if 'BTN' in event.code and event.state == 1:
+                            return
+                except:
+                    pass
+            time.sleep(0.05)
+    else:
+        # Unix/Mac: use select to check stdin and poll controller
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while True:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if rlist:
+                    sys.stdin.read(1)
+                    return
+                # Check for any controller button
+                if gamepad and JOYSTICK_AVAILABLE:
+                    try:
+                        events = inputs.get_gamepad()
+                        for event in events:
+                            if 'BTN' in event.code and event.state == 1:
+                                return
+                    except:
+                        pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+def pause_game():
+    global pause_start_time
+    if pause_event.is_set():
+        pause_event.clear()
+        pause_start_time = time.time()  # Record when we paused
+        # Pause the music when game is paused
+        if MUSIC_AVAILABLE:
+            pause_music()
+            play_pause_sound()  # Play pause sound effect
+    else:
+        # Calculate how long we were paused
+        if pause_start_time is not None:
+            pause_duration = time.time() - pause_start_time
+            # Adjust all bomb timestamps to account for pause
+            for bomb in circles:
+                bomb.timestamp += pause_duration
+            # Also adjust active explosions
+            for i, (explosion_time, cells) in enumerate(active_explosions):
+                active_explosions[i] = (explosion_time + pause_duration, cells)
+            # Adjust enemy movement timers
+            for npc in alive_npcs:
+                if hasattr(npc, 'last_move_time'):
+                    npc.last_move_time += pause_duration
+        pause_start_time = None
+        pause_event.set()
+        # Resume the music when game is unpaused
+        if MUSIC_AVAILABLE:
+            unpause_music()
+            play_pause_sound()  # Play unpause sound effect
+
 def on_press(key):
-    # Deprecated: we now use stdin keyboard_loop for cross-platform arrows; keep for fallback
-    global last_error
+    # Don't process game commands if game is over
+    if game_over_event.is_set():
+        return
+        
     try:
-        ch = getattr(key, 'char', None)
-        if ch:
-            handle_key_char(ch)
-    except Exception:
-        traceback.print_exc()
-        os._exit(1)
+        if key.char == "p":
+            pause_game()
+            return  # Skip further processing when pausing/resuming
+        elif key.char == 'm' and MUSIC_AVAILABLE:
+            # If we're currently unmuted (about to mute), play select sound as confirmation
+            was_muted = not music_enabled
+            if music_enabled:
+                play_select_sound()  # Play this before muting as audio feedback
+            toggle_music()
+            toggle_sound_effects()
+            # If we just unmuted, play select sound as confirmation
+            if was_muted:
+                # Ensure sound effects are initialized after unmuting
+                init_sound_effects()
+                import time
+                time.sleep(0.1)  # Brief delay to ensure sound system is ready
+                play_select_sound()  # Play after unmuting to confirm sounds are back
+            return
+        elif key.char == 'o':
+            # Toggle minimal display mode
+            global minimal_mode
+            minimal_mode = not minimal_mode
+            if MUSIC_AVAILABLE:
+                play_select_sound()  # Play sound when toggling display mode
+            return
+        
+        # Only allow game actions when not paused
+        if pause_event.is_set():
+            if key.char == 'w':
+                player.move_player('w', level_map.grid, enemy.pos)
+            elif key.char == 's':
+                player.move_player('s', level_map.grid, enemy.pos)
+            elif key.char == 'a':
+                player.move_player('a', level_map.grid, enemy.pos)
+            elif key.char == 'd':
+                player.move_player('d', level_map.grid, enemy.pos)
+            elif key.char == 'f' or key.char == ' ':
+                player.put_circle(circles, level_map.grid)
+
+            # Send a backspace character to erase the typed character
+            sys.stdout.write('\b')
+            sys.stdout.flush()
+            # Player 2 controls (if needed)
+            """
+            elif key.char == 'i':
+                enemy.move_player('i', level_map.grid)
+            elif key.char == 'k':
+                enemy.move_player('k', level_map.grid)
+            elif key.char == 'j':
+                enemy.move_player('j', level_map.grid)
+            elif key.char == 'l':
+                enemy.move_player('l', level_map.grid)
+            elif key.char == "ç":
+                enemy.put_circle(circles, level_map.grid)
+            """
+    except AttributeError:
+        pass
 
 def reset_game():
-    global player, player2, enemy, npcs, circles, active_explosions, level_map, SIZE, NUM_NPCS, alive_npcs, npc_scores
+    global player, enemy, npcs, circles, active_explosions, level_map, SIZE, NUM_NPCS
     
     # Scale map size based on number of NPCs (10% per NPC)
     scaled_size = int(DEFAULT_SIZE * (1 + (NUM_NPCS - 1) * 0.1))
     SIZE = scaled_size
-    
-    Player.num_players = 0
-    
+
+    Player.num_players = 0 # hacky thing so that it works in solo
+
     player = Player()
-    player2 = None
-    enemy = None
     npcs = []
-    alive_npcs = []
     
-    if COOP:
-        player2 = Player()
-    else:
-        # Create NPCs based on NUM_NPCS
-        # Icons for different NPCs
-        npc_configs = [
-            {"icon": "🔵", "pos": (SIZE-1, SIZE-1)},  # Bottom-right corner
-            {"icon": "🟢", "pos": (SIZE-1, 0)},       # Top-right corner  
-            {"icon": "🟣", "pos": (0, SIZE-1)}        # Bottom-left corner
-        ]
-        
-        for i in range(min(NUM_NPCS, 3)):
-            config = npc_configs[i]
-            npc = Enemy(icon=config["icon"], position=config["pos"])
-            npcs.append(npc)
-            alive_npcs.append(npc)
-            # Initialize score for this NPC if not already present
-            if config["icon"] not in npc_scores:
-                npc_scores[config["icon"]] = 0
-        
-        # Keep reference to first enemy for backwards compatibility
-        if npcs:
-            enemy = npcs[0]
+    # Create NPCs based on NUM_NPCS
+    # Icons for different NPCs
+    npc_configs = [
+        {"icon": "🔵", "pos": (SIZE-1, SIZE-1)},  # Bottom-right corner
+        {"icon": "🟢", "pos": (SIZE-1, 0)},       # Top-right corner  
+        {"icon": "🟣", "pos": (0, SIZE-1)}        # Bottom-left corner
+    ]
     
+    for i in range(min(NUM_NPCS, 3)):
+        config = npc_configs[i]
+        npc = Enemy(icon=config["icon"], position=config["pos"])
+        npcs.append(npc)
+        # Initialize score for this NPC if not already in dict
+        if config["icon"] not in npc_scores:
+            npc_scores[config["icon"]] = 0
+    
+    # Keep reference to first enemy for backwards compatibility
+    enemy = npcs[0] if npcs else None
+
     circles = deque()
-    
+
     if Circle.all_fire_cells:
         Circle.all_fire_cells = defaultdict(int)
-        
+
     active_explosions = []
     level_map = Map(SIZE, percentage=PERCENTAGE, num_npcs=NUM_NPCS)
-    
+
     # Place NPCs in the grid after map generation
     for npc in npcs:
-        if npc.alive:
+        if npc is not None and hasattr(npc, 'alive') and npc.alive:
             x, y = npc.pos
             level_map.grid[y][x] = ENEMY
-    
+
     for npc in npcs:
         npc.compute_next_moves(level_map.grid, player.pos)
 
 def init_joystick():
     """Initialize joystick support using inputs library"""
-    global joystick_backend, gamepad2
-    if not JOYSTICK_AVAILABLE and not PYGAME_AVAILABLE:
+    global gamepad2
+    if not JOYSTICK_AVAILABLE:
         return None
     
     try:
-        # Try inputs backend first
-        if JOYSTICK_AVAILABLE:
-            gamepads = inputs.DeviceManager().gamepads
-            if gamepads:
-                joystick_backend = 'inputs'
-                # Check for second controller
-                if len(gamepads) > 1 and COOP:
-                    gamepad2 = gamepads[1]
-                else:
-                    gamepad2 = None
-                return gamepads[0]
-        # Fallback to pygame backend
-        if PYGAME_AVAILABLE:
-            os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                pygame.init()
-                pygame.joystick.init()
-            if pygame.joystick.get_count() > 0:
-                js = pygame.joystick.Joystick(0)
-                js.init()
-                joystick_backend = 'pygame'
-                # Check for second controller
-                if pygame.joystick.get_count() > 1 and COOP:
-                    js2 = pygame.joystick.Joystick(1)
-                    js2.init()
-                    gamepad2 = js2
-                else:
-                    gamepad2 = None
-                return js
-        # Silently continue without joystick
-        return None
+        # Try to get available gamepads
+        gamepads = inputs.DeviceManager().gamepads
+        if gamepads:
+            return gamepads[0]
+        else:
+            return None
     except Exception as e:
         return None
 
@@ -1299,83 +1290,20 @@ def handle_joystick():
     DEADZONE = 0.3
     MOVE_DELAY = 0.15
     last_move_time = {}
-    last_move_time2 = {}  # For second controller
     button_states = {}
-    button_states2 = {}  # For second controller
     
+    print("✓ Joystick thread started!")
     while not joystick_stop:
-        if not pause_event.is_set():  # Skip if paused
+        if not pause_event.is_set():  # Game is paused (event cleared)
             time.sleep(0.01)
             continue
         
         try:
-            if joystick_backend == 'inputs':
-                events = inputs.get_gamepad()
-                # If we have a second controller, get its events too
-                if gamepad2:
-                    try:
-                        events2 = inputs.get_gamepad()
-                    except:
-                        events2 = []
-                else:
-                    events2 = []
-            elif joystick_backend == 'pygame':
-                events = []
-                events2 = []
-                pygame.event.pump()
-                # Map pygame events to a minimal inputs-like structure
-                # Axes
-                if gamepad.get_numaxes() >= 2:
-                    events.append(type('E', (), {'code': 'ABS_X', 'state': int(gamepad.get_axis(0) * 32768)}))
-                    events.append(type('E', (), {'code': 'ABS_Y', 'state': int(gamepad.get_axis(1) * 32768)}))
-                # D-Pad (hat) and also synthesize BTN_DPAD_* style events
-                if gamepad.get_numhats() > 0:
-                    hatx, haty = gamepad.get_hat(0)
-                    events.append(type('E', (), {'code': 'ABS_HAT0X', 'state': hatx}))
-                    events.append(type('E', (), {'code': 'ABS_HAT0Y', 'state': haty}))
-                    if hatx == -1:
-                        events.append(type('E', (), {'code': 'BTN_DPAD_LEFT', 'state': 1}))
-                    elif hatx == 1:
-                        events.append(type('E', (), {'code': 'BTN_DPAD_RIGHT', 'state': 1}))
-                    if haty == -1:
-                        events.append(type('E', (), {'code': 'BTN_DPAD_UP', 'state': 1}))
-                    elif haty == 1:
-                        events.append(type('E', (), {'code': 'BTN_DPAD_DOWN', 'state': 1}))
-                # Buttons (map button 0 to BTN_SOUTH, button 7 to BTN_START if present)
-                nb = gamepad.get_numbuttons()
-                if nb > 0:
-                    events.append(type('E', (), {'code': 'BTN_SOUTH', 'state': 1 if gamepad.get_button(0) else 0}))
-                if nb > 7:
-                    events.append(type('E', (), {'code': 'BTN_START', 'state': 1 if gamepad.get_button(7) else 0}))
-                
-                # Handle second controller if present
-                if gamepad2:
-                    if gamepad2.get_numaxes() >= 2:
-                        events2.append(type('E', (), {'code': 'ABS_X', 'state': int(gamepad2.get_axis(0) * 32768)}))
-                        events2.append(type('E', (), {'code': 'ABS_Y', 'state': int(gamepad2.get_axis(1) * 32768)}))
-                    if gamepad2.get_numhats() > 0:
-                        hatx, haty = gamepad2.get_hat(0)
-                        events2.append(type('E', (), {'code': 'ABS_HAT0X', 'state': hatx}))
-                        events2.append(type('E', (), {'code': 'ABS_HAT0Y', 'state': haty}))
-                        if hatx == -1:
-                            events2.append(type('E', (), {'code': 'BTN_DPAD_LEFT', 'state': 1}))
-                        elif hatx == 1:
-                            events2.append(type('E', (), {'code': 'BTN_DPAD_RIGHT', 'state': 1}))
-                        if haty == -1:
-                            events2.append(type('E', (), {'code': 'BTN_DPAD_UP', 'state': 1}))
-                        elif haty == 1:
-                            events2.append(type('E', (), {'code': 'BTN_DPAD_DOWN', 'state': 1}))
-                    nb2 = gamepad2.get_numbuttons()
-                    if nb2 > 0:
-                        events2.append(type('E', (), {'code': 'BTN_SOUTH', 'state': 1 if gamepad2.get_button(0) else 0}))
-                    if nb2 > 7:
-                        events2.append(type('E', (), {'code': 'BTN_START', 'state': 1 if gamepad2.get_button(7) else 0}))
-            else:
-                events = []
-                events2 = []
-        except Exception:
-            traceback.print_exc()
-            os._exit(1)
+            events = inputs.get_gamepad()
+        except Exception as e:
+            print(f"Error reading gamepad: {e}")
+            time.sleep(0.01)
+            continue
         
         current_time = time.time()
         
@@ -1385,25 +1313,16 @@ def handle_joystick():
                 time.sleep(0.01)
                 continue
                 
-            if DEBUG_KEYS:
-                try:
-                    print(f"JS: {event.code}={event.state}")
-                except Exception:
-                    pass
-            # Decide which player the joystick controls
-            target_player = player2 if COOP and player2 is not None else player
-            opponent_pos = player.pos if target_player is player2 else (player2.pos if (COOP and player2 is not None) else (enemy.pos if 'enemy' in globals() and enemy else player.pos))
-
             # Handle analog stick movement
             if event.code == 'ABS_X':  # Left stick horizontal
                 value = event.state / 32768.0  # Normalize to -1 to 1
                 if abs(value) > DEADZONE:
                     if current_time - last_move_time.get('x', 0) > MOVE_DELAY:
                         if value < -DEADZONE:
-                            target_player.move_player('a', level_map.grid, opponent_pos)
+                            player.move_player('a', level_map.grid, enemy.pos)
                             last_move_time['x'] = current_time
                         elif value > DEADZONE:
-                            target_player.move_player('d', level_map.grid, opponent_pos)
+                            player.move_player('d', level_map.grid, enemy.pos)
                             last_move_time['x'] = current_time
             
             elif event.code == 'ABS_Y':  # Left stick vertical (inverted)
@@ -1411,53 +1330,35 @@ def handle_joystick():
                 if abs(value) > DEADZONE:
                     if current_time - last_move_time.get('y', 0) > MOVE_DELAY:
                         if value < -DEADZONE:
-                            target_player.move_player('w', level_map.grid, opponent_pos)
+                            player.move_player('w', level_map.grid, enemy.pos)
                             last_move_time['y'] = current_time
                         elif value > DEADZONE:
-                            target_player.move_player('s', level_map.grid, opponent_pos)
+                            player.move_player('s', level_map.grid, enemy.pos)
                             last_move_time['y'] = current_time
             
             # Handle D-Pad
             elif event.code == 'ABS_HAT0X':  # D-Pad horizontal
                 if current_time - last_move_time.get('dpad_x', 0) > MOVE_DELAY:
                     if event.state == -1:
-                        target_player.move_player('a', level_map.grid, opponent_pos)
+                        player.move_player('a', level_map.grid, enemy.pos)
                         last_move_time['dpad_x'] = current_time
                     elif event.state == 1:
-                        target_player.move_player('d', level_map.grid, opponent_pos)
+                        player.move_player('d', level_map.grid, enemy.pos)
                         last_move_time['dpad_x'] = current_time
             
-            elif event.code == 'ABS_HAT0Y':  # D-Pad vertical (standard: -1 up, 1 down)
+            elif event.code == 'ABS_HAT0Y':  # D-Pad vertical (inverted)
                 if current_time - last_move_time.get('dpad_y', 0) > MOVE_DELAY:
-                    if event.state == -1:
-                        target_player.move_player('w', level_map.grid, opponent_pos)
+                    if event.state == 1:
+                        player.move_player('w', level_map.grid, enemy.pos)
                         last_move_time['dpad_y'] = current_time
-                    elif event.state == 1:
-                        target_player.move_player('s', level_map.grid, opponent_pos)
+                    elif event.state == -1:
+                        player.move_player('s', level_map.grid, enemy.pos)
                         last_move_time['dpad_y'] = current_time
-            
-            # Handle D-Pad as buttons (some drivers emit BTN_DPAD_*)
-            elif event.code == 'BTN_DPAD_LEFT':
-                if event.state == 1 and current_time - last_move_time.get('dpad_x', 0) > MOVE_DELAY:
-                    target_player.move_player('a', level_map.grid, opponent_pos)
-                    last_move_time['dpad_x'] = current_time
-            elif event.code == 'BTN_DPAD_RIGHT':
-                if event.state == 1 and current_time - last_move_time.get('dpad_x', 0) > MOVE_DELAY:
-                    target_player.move_player('d', level_map.grid, opponent_pos)
-                    last_move_time['dpad_x'] = current_time
-            elif event.code == 'BTN_DPAD_UP':
-                if event.state == 1 and current_time - last_move_time.get('dpad_y', 0) > MOVE_DELAY:
-                    target_player.move_player('w', level_map.grid, opponent_pos)
-                    last_move_time['dpad_y'] = current_time
-            elif event.code == 'BTN_DPAD_DOWN':
-                if event.state == 1 and current_time - last_move_time.get('dpad_y', 0) > MOVE_DELAY:
-                    target_player.move_player('s', level_map.grid, opponent_pos)
-                    last_move_time['dpad_y'] = current_time
             
             # Handle buttons
             elif event.code == 'BTN_SOUTH':  # A button (Xbox) / X button (PS)
                 if event.state == 1 and not button_states.get('bomb', False):
-                    target_player.put_circle(circles, level_map.grid)
+                    player.put_circle(circles, level_map.grid)
                     button_states['bomb'] = True
                 elif event.state == 0:
                     button_states['bomb'] = False
@@ -1498,475 +1399,100 @@ def handle_joystick():
                     time.sleep(0.5)
                 elif event.state == 0:
                     button_states['pause'] = False
-        
-        # Process second controller events if available
-        if gamepad2 and COOP and player2:
-            for event in events2:
-                # Skip joystick events if game is over
-                if game_over_event.is_set():
-                    time.sleep(0.01)
-                    continue
-                
-                if DEBUG_KEYS:
-                    try:
-                        print(f"JS2: {event.code}={event.state}")
-                    except Exception:
-                        pass
-                
-                # Second controller always controls player2 in COOP
-                target_player = player2
-                opponent_pos = player.pos
-                
-                # Handle analog stick movement
-                if event.code == 'ABS_X':  # Left stick horizontal
-                    value = event.state / 32768.0  # Normalize to -1 to 1
-                    if abs(value) > DEADZONE:
-                        if current_time - last_move_time2.get('x', 0) > MOVE_DELAY:
-                            if value < -DEADZONE:
-                                target_player.move_player('j', level_map.grid, opponent_pos)
-                                last_move_time2['x'] = current_time
-                            elif value > DEADZONE:
-                                target_player.move_player('l', level_map.grid, opponent_pos)
-                                last_move_time2['x'] = current_time
-                
-                elif event.code == 'ABS_Y':  # Left stick vertical (inverted)
-                    value = event.state / 32768.0  # Normalize to -1 to 1
-                    if abs(value) > DEADZONE:
-                        if current_time - last_move_time2.get('y', 0) > MOVE_DELAY:
-                            if value < -DEADZONE:
-                                target_player.move_player('i', level_map.grid, opponent_pos)
-                                last_move_time2['y'] = current_time
-                            elif value > DEADZONE:
-                                target_player.move_player('k', level_map.grid, opponent_pos)
-                                last_move_time2['y'] = current_time
-                
-                # Handle D-Pad
-                elif event.code == 'ABS_HAT0X':  # D-Pad horizontal
-                    if current_time - last_move_time2.get('dpad_x', 0) > MOVE_DELAY:
-                        if event.state == -1:
-                            target_player.move_player('j', level_map.grid, opponent_pos)
-                            last_move_time2['dpad_x'] = current_time
-                        elif event.state == 1:
-                            target_player.move_player('l', level_map.grid, opponent_pos)
-                            last_move_time2['dpad_x'] = current_time
-                
-                elif event.code == 'ABS_HAT0Y':  # D-Pad vertical (standard: -1 up, 1 down)
-                    if current_time - last_move_time2.get('dpad_y', 0) > MOVE_DELAY:
-                        if event.state == -1:
-                            target_player.move_player('i', level_map.grid, opponent_pos)
-                            last_move_time2['dpad_y'] = current_time
-                        elif event.state == 1:
-                            target_player.move_player('k', level_map.grid, opponent_pos)
-                            last_move_time2['dpad_y'] = current_time
-                
-                # Handle D-Pad as buttons (some drivers emit BTN_DPAD_*)
-                elif event.code == 'BTN_DPAD_LEFT':
-                    if event.state == 1 and current_time - last_move_time2.get('dpad_x', 0) > MOVE_DELAY:
-                        target_player.move_player('j', level_map.grid, opponent_pos)
-                        last_move_time2['dpad_x'] = current_time
-                elif event.code == 'BTN_DPAD_RIGHT':
-                    if event.state == 1 and current_time - last_move_time2.get('dpad_x', 0) > MOVE_DELAY:
-                        target_player.move_player('l', level_map.grid, opponent_pos)
-                        last_move_time2['dpad_x'] = current_time
-                elif event.code == 'BTN_DPAD_UP':
-                    if event.state == 1 and current_time - last_move_time2.get('dpad_y', 0) > MOVE_DELAY:
-                        target_player.move_player('i', level_map.grid, opponent_pos)
-                        last_move_time2['dpad_y'] = current_time
-                elif event.code == 'BTN_DPAD_DOWN':
-                    if event.state == 1 and current_time - last_move_time2.get('dpad_y', 0) > MOVE_DELAY:
-                        target_player.move_player('k', level_map.grid, opponent_pos)
-                        last_move_time2['dpad_y'] = current_time
-                
-                # Handle buttons
-                elif event.code == 'BTN_SOUTH':  # A button (Xbox) / X button (PS)
-                    if event.state == 1 and not button_states2.get('bomb', False):
-                        target_player.put_circle(circles, level_map.grid)
-                        button_states2['bomb'] = True
-                    elif event.state == 0:
-                        button_states2['bomb'] = False
-                
-                elif event.code == 'BTN_START':  # Start/Menu button
-                    if event.state == 1 and not button_states2.get('pause', False):
-                        pause_game()
-                        button_states2['pause'] = True
-                        time.sleep(0.5)
-                    elif event.state == 0:
-                        button_states2['pause'] = False
 
-move_interval = 0.25
-last_move_time = time.time()  # Record the start time
-
-player_score = 0
-enemy_score = 0
-# Individual NPC scores
-npc_scores = {}
-
-# Display mode
-minimal_mode = False  # Toggle with 'o' to show only grid and scoreboard
-
-# Game state support (used by joystick thread and keyboard 'p')
-pause_event = threading.Event()
-pause_event.set()  # Start unpaused
-game_over_event = threading.Event()  # Set when game is over
-game_over_event.clear()  # Start not game over
-pause_start_time = None  # Track when pause started
-
-def wait_for_any_input():
-    """Wait for keyboard or controller input"""
-    # Wait for keyboard or any controller button
-    if os.name == 'nt':
-        import msvcrt
-        # Windows: check both keyboard and controller
-        while True:
-            if msvcrt.kbhit():
-                msvcrt.getch()
-                return
-            # Check for any controller button
-            if gamepad:
-                try:
-                    if joystick_backend == 'inputs':
-                        events = inputs.get_gamepad()
-                        for event in events:
-                            if 'BTN' in event.code and event.state == 1:
-                                return
-                    elif joystick_backend == 'pygame':
-                        pygame.event.pump()
-                        for i in range(gamepad.get_numbuttons()):
-                            if gamepad.get_button(i):
-                                return
-                except:
-                    pass
-            time.sleep(0.05)
+if __name__ == "__main__":
+    # Initialize joystick
+    gamepad = init_joystick()
+    joystick_stop = False
+    
+    # Debug output
+    if gamepad:
+        print("✓ Joystick initialized successfully!")
     else:
-        # Unix/Mac: use select to check stdin and poll controller
-        fd = sys.stdin.fileno()
-        old_attrs = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while True:
-                rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if rlist:
-                    sys.stdin.read(1)
-                    return
-                # Check for any controller button
-                if gamepad:
-                    try:
-                        if joystick_backend == 'inputs':
-                            events = inputs.get_gamepad()
-                            for event in events:
-                                if 'BTN' in event.code and event.state == 1:
-                                    return
-                        elif joystick_backend == 'pygame':
-                            pygame.event.pump()
-                            for i in range(gamepad.get_numbuttons()):
-                                if gamepad.get_button(i):
-                                    return
-                    except:
-                        pass
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
-
-def pause_game():
-    global pause_start_time
-    if pause_event.is_set():
-        pause_event.clear()
-        pause_start_time = time.time()  # Record when we paused
-        # Pause the music when game is paused
-        if MUSIC_AVAILABLE:
-            pause_music()
-            play_pause_sound()  # Play pause sound effect
-    else:
-        # Calculate how long we were paused
-        if pause_start_time is not None:
-            pause_duration = time.time() - pause_start_time
-            # Adjust all bomb timestamps to account for pause
-            for bomb in circles:
-                bomb.timestamp += pause_duration
-            # Also adjust active explosions
-            for i, (explosion_time, cells) in enumerate(active_explosions):
-                active_explosions[i] = (explosion_time + pause_duration, cells)
-            # Adjust enemy movement timers
-            for npc in npcs:
-                if hasattr(npc, 'last_move_time'):
-                    npc.last_move_time += pause_duration
-        pause_start_time = None
-        pause_event.set()
-        # Resume the music when game is unpaused
-        if MUSIC_AVAILABLE:
-            unpause_music()
-            play_pause_sound()  # Play unpause sound effect
-
-# Alias expected by existing input handlers
-def pause():
-    pause_game()
-
-# Simple stdin-based keyboard reader (avoids macOS Accessibility dependency)
-def handle_key_char(ch):
-    global last_error
-    if not ch:
-        return
+        print("✗ No joystick detected")
     
-    # Don't process game commands if game is over
-    if game_over_event.is_set():
-        return
+    # Start keyboard listener
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
     
-    try:
-        if DEBUG_KEYS:
-            print(f"Key: {repr(ch)}")
-        
-        # Commands that work even when paused
-        if ch == 'p':
-            pause()
-        elif ch == 'm':
-            # Toggle all sounds on/off (music and sound effects)
-            if MUSIC_AVAILABLE:
-                # If we're currently unmuted (about to mute), play select sound as confirmation
-                was_muted = not music_enabled
-                if music_enabled:
-                    play_select_sound()  # Play this before muting as audio feedback
-                toggle_music()
-                toggle_sound_effects()
-                # If we just unmuted, play select sound as confirmation
-                if was_muted:
-                    # Ensure sound effects are initialized after unmuting
-                    init_sound_effects()
-                    import time
-                    time.sleep(0.1)  # Brief delay to ensure sound system is ready
-                    play_select_sound()  # Play after unmuting to confirm sounds are back
-        elif ch == 'o':
-            # Toggle minimal display mode
-            global minimal_mode
-            minimal_mode = not minimal_mode
-            if MUSIC_AVAILABLE:
-                play_select_sound()  # Play sound when toggling display mode
-        # Movement and game commands only work when not paused
-        elif pause_event.is_set():  # Game is NOT paused (event is set when running)
-            if COOP and player2 is not None:
-                # In COOP mode: Red player (player 1) uses WASD + F
-                if ch == 'w':
-                    player.move_player('w', level_map.grid, player2.pos)
-                elif ch == 's':
-                    player.move_player('s', level_map.grid, player2.pos)
-                elif ch == 'a':
-                    player.move_player('a', level_map.grid, player2.pos)
-                elif ch == 'd':
-                    player.move_player('d', level_map.grid, player2.pos)
-                elif ch == 'f':
-                    player.put_circle(circles, level_map.grid)
-                # Space bar is for blue player (player 2) bomb in coop mode
-                elif ch == ' ':
-                    player2.put_circle(circles, level_map.grid)
-            else:
-                # Single player mode: player 1 uses WASD or arrow keys + F or space
-                if ch == 'w':
-                    player.move_player('w', level_map.grid, enemy.pos if 'enemy' in globals() and enemy else (0, 0))
-                elif ch == 's':
-                    player.move_player('s', level_map.grid, enemy.pos if 'enemy' in globals() and enemy else (0, 0))
-                elif ch == 'a':
-                    player.move_player('a', level_map.grid, enemy.pos if 'enemy' in globals() and enemy else (0, 0))
-                elif ch == 'd':
-                    player.move_player('d', level_map.grid, enemy.pos if 'enemy' in globals() and enemy else (0, 0))
-                elif ch == 'f' or ch == ' ':
-                    player.put_circle(circles, level_map.grid)
-    except Exception:
-        traceback.print_exc()
-        os._exit(1)
-
-def keyboard_loop():
-    try:
-        if os.name == 'nt':
-            while not keyboard_stop:
-                if msvcrt.kbhit():
-                    ch = msvcrt.getwch()
-                    handle_key_char(ch)
-                time.sleep(0.005)
-        else:
-            fd = sys.stdin.fileno()
-            old_attrs = termios.tcgetattr(fd)
-            tty.setcbreak(fd)
-            try:
-                while not keyboard_stop:
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
-                    if rlist:
-                        ch = sys.stdin.read(1)
-                        # Handle escape sequences (arrows)
-                        if ch == '\x1b':
-                            seq = sys.stdin.read(2)  # e.g., '[A'
-                            if COOP and player2 is not None:
-                                # Map arrows to player2 (blue) when in coop
-                                if seq == '[A':
-                                    player2.move_player('i', level_map.grid, player.pos)  # Up
-                                elif seq == '[B':
-                                    player2.move_player('k', level_map.grid, player.pos)  # Down
-                                elif seq == '[C':
-                                    player2.move_player('l', level_map.grid, player.pos)  # Right
-                                elif seq == '[D':
-                                    player2.move_player('j', level_map.grid, player.pos)  # Left
-                                continue
-                            else:
-                                # Single player: Map arrows to player1 as WASD
-                                if seq == '[A':
-                                    ch = 'w'
-                                elif seq == '[B':
-                                    ch = 's'
-                                elif seq == '[C':
-                                    ch = 'd'
-                                elif seq == '[D':
-                                    ch = 'a'
-                                else:
-                                    ch = ''
-                        handle_key_char(ch)
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
-    except Exception:
-        traceback.print_exc()
-        os._exit(1)
-
-def main():
-    global COOP, SIZE, NUM_NPCS
-    parser = argparse.ArgumentParser(description="Terminal Bomberman")
-    parser.add_argument("--coop", action="store_true", help="Enable 2-player coop (shared keyboard / joystick)")
-    parser.add_argument("--size", type=int, default=None, help=f"Board size (default {DEFAULT_SIZE})")
-    parser.add_argument("--npcs", type=int, default=1, choices=[1, 2, 3], help="Number of NPC enemies (1-3, default 1)")
-    parser.add_argument("--mute", action="store_true", help="Start game with all sounds muted")
-    args = parser.parse_args()
-
-    # Apply configuration
-    COOP = bool(args.coop)
-    NUM_NPCS = args.npcs if not COOP else 0  # No NPCs in co-op mode
+    # Start joystick handler thread if available
+    joystick_thread = None
+    if gamepad and JOYSTICK_AVAILABLE:
+        print("✓ Starting joystick thread...")
+        joystick_thread = threading.Thread(target=handle_joystick, daemon=True)
+        joystick_thread.start()
     
-    if args.size:
-        # Clamp to sane bounds
-        s = max(6, min(50, int(args.size)))
-        globals()["DEFAULT_SIZE"] = s
-        # Size will be scaled in reset_game() based on NUM_NPCS
-
-    # Initialize joystick and game state BEFORE starting input listeners
-    gamepad_init = init_joystick()
-    globals()["gamepad"] = gamepad_init
-    globals()["joystick_stop"] = False
     reset_game()
-
-    # Handle mute flag
-    if args.mute and MUSIC_AVAILABLE:
-        # Start with all sounds muted
-        toggle_music()  # Toggle from True to False
-        toggle_sound_effects()  # Toggle from True to False
     
     # Initialize sound effects and play stage start music then battle music
     if MUSIC_AVAILABLE:
         try:
             init_sound_effects()  # Initialize sound effects
-            if not args.mute:  # Only play sounds if not muted
-                play_bomberman_scream()  # Play scream sound on game start
-                play_stage_start()
-                # Start battle music after stage start finishes (approx 3 seconds)
-                threading.Timer(3.0, start_jungle_music).start()
+            play_bomberman_scream()  # Play scream sound on game start
+            play_stage_start()
+            # Start battle music after stage start finishes (approx 3 seconds)
+            threading.Timer(3.0, start_jungle_music).start()
         except Exception as e:
             pass  # Could not start music - fail silently
 
-    # Start stdin keyboard reader (replaces pynput listener on macOS)
-    globals()["keyboard_stop"] = False
-    kb_thread = threading.Thread(target=keyboard_loop, daemon=True)
-    kb_thread.start()
-
-    # Start joystick handler thread if available
-    joystick_thread = None
-    if gamepad_init and (JOYSTICK_AVAILABLE or PYGAME_AVAILABLE):
-        joystick_thread = threading.Thread(target=handle_joystick, daemon=True)
-        joystick_thread.start()
-
     try:
         while True:
-            try:
-                # Check if match is won (handled inside match_winner)
-                if game_over_event.is_set():
-                    time.sleep(0.1)
-                    continue
-                    
-                # Check if game is paused
-                if not pause_event.is_set():
-                    if RENDER_ENABLED:
-                        clear_screen()
-                        # Show the frozen grid state
-                        level_map.draw(npcs)
-                        print("\n⏸️  GAME PAUSED - Press 'p' to resume")
-                        
-                        # Display controls unless in minimal mode
-                        if not minimal_mode:
-                            print("\n" + "-" * 40)
-                            if COOP:
-                                if gamepad:
-                                    print("🎮 Controller 1: [D-Pad]: Move  [A]: Bomb")
-                                else:
-                                    print("🔴 Red (P1): [WASD]: Move   [F]: Bomb")
-                                if gamepad2:
-                                    print("🎮 Controller 2: [D-Pad]: Move  [A]: Bomb")
-                                else:
-                                    print("🔵 Blue (P2): [↑↓←→]: Move  [SPACE]: Bomb")
-                            else:
-                                if gamepad:
-                                    print("🎮 [D-Pad]: Move      [A]: Bomb")
-                                    print("🎮 [Y]: Mute sounds   [X]: Omit details")
-                                    print("🎮 [Start]: Resume game")
-                                else:
-                                    print("[↑↓←→ or WASD]: Move  [F or SPACE]: Bomb")
-                                    print("[M]: Mute sounds       [O]: Omit details")
-                                    print("[P]: Resume game")
-                    time.sleep(0.1)
-                    continue
-                
-                # Normal game logic
-                if RENDER_ENABLED:
-                    clear_screen()
+            # Check if game is over
+            if game_over_event.is_set():
+                time.sleep(0.1)  # Wait a bit before checking again
+                continue
+            
+            # Check if game is paused
+            if pause_event.is_set():
+                clear_screen()
                 Circle.detonate_circles(circles, level_map.grid, active_explosions)
 
                 for npc in npcs:
-                    if npc.alive:
-                        npc.move(level_map.grid, player.pos)
+                    npc.move(level_map.grid, player.pos)
 
-                if RENDER_ENABLED:
-                    level_map.draw(npcs)
-                    
-                    # Display controls unless in minimal mode
-                    if not minimal_mode:
-                        print(f"\nFirst to {MATCH_WINNING_SCORE} wins!")
-                        print("\n" + "-" * 40)
-                        if COOP:
-                            if gamepad:
-                                print("🎮 Controller 1: [D-Pad]: Move  [A]: Bomb")
-                            else:
-                                print("🔴 Red (P1): [WASD]: Move   [F]: Bomb")
-                            if gamepad2:
-                                print("🎮 Controller 2: [D-Pad]: Move  [A]: Bomb")
-                            else:
-                                print("🔵 Blue (P2): [↑↓←→]: Move  [SPACE]: Bomb")
-                        else:
-                            if gamepad:
-                                print("🎮 [D-Pad]: Move      [A]: Bomb")
-                                print("🎮 [Y]: Mute sounds   [X]: Omit details")
-                                print("🎮 [Start]: Pause game")
-                            else:
-                                print("[↑↓←→ or WASD]: Move  [F or SPACE]: Bomb")
-                                print("[M]: Mute sounds       [O]: Omit details")
-                                print("[P]: Pause game")
+                # Update explosions and draw
+                level_map.draw(npcs)
+                
+                # Display controls unless in minimal mode
+                if not minimal_mode:
+                    print(f"\nFirst to {MATCH_WINNING_SCORE} wins!")
+                    print("\n" + "-" * 40)
+                    if gamepad and JOYSTICK_AVAILABLE:
+                        print("🎮 [D-Pad]: Move      [A]: Bomb")
+                        print("🎮 [Y]: Mute sounds   [X]: Omit details")
+                        print("🎮 [Start]: Pause game")
+                    else:
+                        print("[↑↓←→ or WASD]: Move  [F or SPACE]: Bomb")
+                        print("[M]: Mute sounds       [O]: Omit details")
+                        print("[P]: Pause game")
 
                 Circle.update_explosions(active_explosions, level_map.grid, player, npcs)
+            else:
+                # Display paused game with frozen grid
+                clear_screen()
+                # Show the frozen grid state
+                level_map.draw(npcs)
+                print("\n⏸️  GAME PAUSED - Press 'p' to resume")
+                
+                # Display controls unless in minimal mode
+                if not minimal_mode:
+                    print("\n" + "-" * 40)
+                    if gamepad and JOYSTICK_AVAILABLE:
+                        print("🎮 [D-Pad]: Move      [A]: Bomb")
+                        print("🎮 [Y]: Mute sounds   [X]: Omit details")
+                        print("🎮 [Start]: Resume game")
+                    else:
+                        print("[↑↓←→ or WASD]: Move  [F or SPACE]: Bomb")
+                        print("[M]: Mute sounds       [O]: Omit details")
+                        print("[P]: Resume game")
+                
+                time.sleep(0.2)  # Longer sleep when paused to reduce flicker
+                continue
 
-                time.sleep(1 / FPS)
-            except Exception:
-                # Print the error once and exit immediately so redraw doesn't hide it
-                traceback.print_exc()
-                sys.stdout.flush()
-                sys.stderr.flush()
-                os._exit(1)
+            time.sleep(1/FPS)
     except KeyboardInterrupt:
-        globals()["joystick_stop"] = True
-        globals()["keyboard_stop"] = True
+        joystick_stop = True
         if MUSIC_AVAILABLE:
             stop_jungle_music()
         print("\nGame ended.")
 
-
-if __name__ == "__main__":
-    main()
